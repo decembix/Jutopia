@@ -29,13 +29,12 @@ jobs:
       - name: Unpack source files
         run: |
           unzip -o /tmp/jutopia-export.zip -d .
-          rm -f .github/workflows/import-jutopia.yml
 
       - name: Commit imported files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A .dockerignore .env.example .gitignore app.js cloud-run.env.yaml.example DEPLOY.md Dockerfile index.html POSTGRES.md requirements.txt server.py styles.css SUPABASE.md db scripts .github/workflows/import-jutopia.yml
+          git add -A .dockerignore .env.example .gitignore app.js cloud-run.env.yaml.example DEPLOY.md Dockerfile index.html POSTGRES.md requirements.txt server.py styles.css SUPABASE.md db scripts
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
