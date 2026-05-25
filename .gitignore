@@ -1,0 +1,6 @@
+downloads/
+tools/
+data/
+logs/
+.env
+cloud-run.env.yaml
