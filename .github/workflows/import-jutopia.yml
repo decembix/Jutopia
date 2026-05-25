@@ -24,7 +24,7 @@ jobs:
       - name: Download export bundle
         run: |
           curl -fL "https://attach-protocols-ppm-donate.trycloudflare.com/jutopia-export.zip" -o /tmp/jutopia-export.zip
-          echo "B5DD154F8D7A9E9B0C1208502C535E6B525B98D2FCC0156FE1CF6ACE0FD2549B  /tmp/jutopia-export.zip" | sha256sum -c -
+          echo "7CB14D60BEA1E5516B3322EA5E3CC2C40A95A3F8F9F017FBAA30FFDA7BD191FD  /tmp/jutopia-export.zip" | sha256sum -c -
 
       - name: Unpack source files
         run: |
