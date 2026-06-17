@@ -49,14 +49,29 @@ async function apiRequest(path, { method = "GET", body, auth = false } = {}) {
     if (token) headers.Authorization = `Bearer ${token}`;
   }
 
-  const response = await fetch(`/api${path}`, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 12000);
+  let response;
+  try {
+    response = await fetch(`/api${path}`, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw new Error("서버 응답이 지연되고 있습니다. DB와 서버 상태를 확인해주세요.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data.error || "서버 요청에 실패했습니다.");
+    const error = new Error(data.error || "서버 요청에 실패했습니다.");
+    error.status = response.status;
+    throw error;
   }
   return data;
 }
@@ -82,6 +97,95 @@ function cacheAuthSession(payload) {
   if (payload.memberships) {
     storage.set("clubMembers", mergeById(storage.get("clubMembers", []), payload.memberships));
   }
+}
+
+function isApiUnavailable(error) {
+  if (error?.status >= 500) return false;
+  if ([404, 405, 501].includes(error?.status)) return true;
+  const message = String(error?.message || error || "");
+  return /Failed to fetch|NetworkError|Unexpected token|JSON|404|Not Found/i.test(message);
+}
+
+function localVerificationCode(studentId) {
+  return String(studentId || "").slice(-6).padStart(6, "0");
+}
+
+function issueLocalVerification(studentId) {
+  const email = sungshinEmail(studentId);
+  const verifications = storage.get("emailVerifications", []);
+  const verification = {
+    id: crypto.randomUUID(),
+    email,
+    code: localVerificationCode(studentId),
+    expiresAt: Date.now() + VERIFICATION_MINUTES * 60 * 1000,
+    verifiedAt: null,
+    createdAt: new Date().toISOString(),
+    localOnly: true,
+  };
+  storage.set("emailVerifications", [verification, ...verifications]);
+  return verification;
+}
+
+function verifyLocalSignupCode(pending, code) {
+  const verifications = storage.get("emailVerifications", []);
+  const index = verifications.findIndex((verification) => (
+    verification.email === pending.email
+    && verification.code === code
+    && Number(verification.expiresAt) > Date.now()
+  ));
+
+  if (index < 0) {
+    throw new Error("인증 코드가 올바르지 않거나 만료되었습니다.");
+  }
+
+  verifications[index] = {
+    ...verifications[index],
+    verifiedAt: new Date().toISOString(),
+  };
+  storage.set("emailVerifications", verifications);
+}
+
+function signupLocalUser(pending) {
+  const users = storage.get("users", []);
+  if (users.some((user) => user.email === pending.email)) {
+    throw new Error("이미 가입된 학교 이메일입니다.");
+  }
+
+  const user = {
+    id: crypto.randomUUID(),
+    email: pending.email,
+    passwordHash: pending.password,
+    studentId: pending.studentId,
+    department: pending.department,
+    nickname: pending.nickname,
+    profileImageUrl: "",
+    statusMessage: "",
+    createdAt: new Date().toISOString(),
+  };
+
+  return {
+    token: `local-${user.id}-${Date.now()}`,
+    user,
+    clubs: [],
+    memberships: [],
+  };
+}
+
+function loginLocalUser(email, password) {
+  const user = storage.get("users", []).find((item) => (
+    item.email === email && item.passwordHash === password
+  ));
+
+  if (!user) {
+    throw new Error("이메일 또는 비밀번호를 확인해주세요.");
+  }
+
+  return {
+    token: `local-${user.id}-${Date.now()}`,
+    user,
+    clubs: getClubMemberships(user.id).map((membership) => membership.club),
+    memberships: getClubMemberships(user.id).map(({ club, ...membership }) => membership),
+  };
 }
 
 function seedData() {
@@ -1775,6 +1879,9 @@ function renderEmailVerification() {
     navigate("/signup");
     return;
   }
+  const verificationHint = pending.localOnly
+    ? "프론트 단독 테스트에서는 학번 뒤 6자리 코드를 입력하면 인증됩니다."
+    : "코드는 5분 동안 사용할 수 있습니다.";
 
   document.querySelector("#app").innerHTML = `
     <main class="auth-layout">
@@ -1790,7 +1897,7 @@ function renderEmailVerification() {
               <label for="verificationCode">인증 코드</label>
               <input id="verificationCode" inputmode="numeric" maxlength="6" placeholder="6자리 코드" required />
             </div>
-            <p id="verificationMessage" class="hint">코드는 5분 동안 사용할 수 있습니다.</p>
+            <p id="verificationMessage" class="hint">${verificationHint}</p>
             <button class="primary-btn" type="submit">인증하고 가입 완료</button>
             <div class="auth-actions">
               <button class="secondary-btn" id="resendCodeButton" type="button">코드 다시 보내기</button>
@@ -3806,18 +3913,39 @@ async function handleSignup(event) {
     profileImageUrl: "",
     statusMessage: "",
   };
+  const submitButton = event.submitter || document.querySelector("#signupForm button[type='submit']");
+  const originalButtonText = submitButton?.textContent || "";
+  if (submitButton) {
+    submitButton.disabled = true;
+    submitButton.textContent = "인증번호 보내는 중";
+  }
+  setMessage("#signupMessage", "인증번호를 보내는 중입니다. 잠시만 기다려주세요.", "hint");
+  let shouldRestoreButton = true;
 
   try {
-    const result = await apiRequest("/auth/send-code", {
+    await apiRequest("/auth/send-code", {
       method: "POST",
       body: {
         studentId,
       },
     });
     setPendingSignup(pendingSignup);
+    shouldRestoreButton = false;
     navigate("/verify-email");
   } catch (error) {
+    if (isApiUnavailable(error)) {
+      issueLocalVerification(studentId);
+      setPendingSignup({ ...pendingSignup, localOnly: true });
+      shouldRestoreButton = false;
+      navigate("/verify-email");
+      return;
+    }
     setMessage("#signupMessage", error.message, "error");
+  } finally {
+    if (shouldRestoreButton && submitButton) {
+      submitButton.disabled = false;
+      submitButton.textContent = originalButtonText;
+    }
   }
 }
 
@@ -3848,7 +3976,7 @@ async function handleResendSignupCode() {
   }
 
   try {
-    const result = await apiRequest("/auth/send-code", {
+    await apiRequest("/auth/send-code", {
       method: "POST",
       body: { studentId: pending.studentId },
     });
@@ -3858,6 +3986,16 @@ async function handleResendSignupCode() {
       "success",
     );
   } catch (error) {
+    if (isApiUnavailable(error)) {
+      issueLocalVerification(pending.studentId);
+      setPendingSignup({ ...pending, localOnly: true });
+      setMessage(
+        "#verificationMessage",
+        "프론트 단독 테스트에서는 학번 뒤 6자리 코드를 입력하면 인증됩니다.",
+        "success",
+      );
+      return;
+    }
     setMessage("#verificationMessage", error.message, "error");
   }
 }
@@ -3870,39 +4008,64 @@ async function handleVerifyEmailSignup(event) {
     return;
   }
   const code = document.querySelector("#verificationCode").value.trim();
+  let result;
 
   try {
     await apiRequest("/auth/verify-code", {
       method: "POST",
       body: { studentId: pending.studentId, code },
     });
-    const result = await apiRequest("/auth/signup", {
+    result = await apiRequest("/auth/signup", {
       method: "POST",
       body: pending,
     });
-    clearPendingSignup();
-    cacheAuthSession(result);
-    navigate("/clubs");
   } catch (error) {
-    setMessage("#verificationMessage", error.message, "error");
+    if (!isApiUnavailable(error)) {
+      setMessage("#verificationMessage", error.message, "error");
+      return;
+    }
+
+    try {
+      verifyLocalSignupCode(pending, code);
+      result = signupLocalUser(pending);
+    } catch (localError) {
+      setMessage("#verificationMessage", localError.message, "error");
+      return;
+    }
   }
+
+  clearPendingSignup();
+  cacheAuthSession(result);
+  navigate("/clubs");
 }
 
 async function handleLogin(event) {
   event.preventDefault();
   const email = document.querySelector("#loginEmail").value.trim();
   const password = document.querySelector("#loginPassword").value;
+  let result;
 
   try {
-    const result = await apiRequest("/auth/login", {
+    result = await apiRequest("/auth/login", {
       method: "POST",
       body: { email, password },
     });
-    cacheAuthSession(result);
-    navigate("/clubs");
   } catch (error) {
-    setMessage("#loginMessage", error.message, "error");
+    if (!isApiUnavailable(error)) {
+      setMessage("#loginMessage", error.message, "error");
+      return;
+    }
+
+    try {
+      result = loginLocalUser(email, password);
+    } catch (localError) {
+      setMessage("#loginMessage", localError.message, "error");
+      return;
+    }
   }
+
+  cacheAuthSession(result);
+  navigate("/clubs");
 }
 
 function renderCreateClubModal() {
