@@ -22,8 +22,18 @@ LOCAL_PACKAGES = BASE_DIR / "tools" / "python-packages"
 if LOCAL_PACKAGES.exists():
   sys.path.insert(0, str(LOCAL_PACKAGES))
 
-import psycopg
-from psycopg.rows import dict_row
+try:
+  import psycopg
+  from psycopg.rows import dict_row
+  UNIQUE_VIOLATION_ERROR = psycopg.errors.UniqueViolation
+except ModuleNotFoundError:
+  psycopg = None
+  dict_row = None
+
+  class MissingPsycopgUniqueViolation(Exception):
+    pass
+
+  UNIQUE_VIOLATION_ERROR = MissingPsycopgUniqueViolation
 
 SCHOOL_EMAIL_PATTERN = re.compile(r"^[^\s@]+@(?:[a-z0-9-]+\.)?(?:ac\.kr|edu)$", re.I)
 STUDENT_ID_PATTERN = re.compile(r"^\d{8}$")
@@ -48,6 +58,7 @@ def load_env() -> None:
 load_env()
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
+DEV_NO_DB = os.environ.get("JUTOPIA_DEV_NO_DB", "").lower() in {"1", "true", "yes", "on"} or not DATABASE_URL
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "jutopia-dev-session-secret")
 EMAIL_MODE = os.environ.get("EMAIL_MODE", "dev")
 SMTP_HOST = os.environ.get("SMTP_HOST", "")
@@ -63,6 +74,8 @@ HOST = os.environ.get("HOST", "0.0.0.0")
 def db():
   if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not configured")
+  if psycopg is None:
+    raise RuntimeError("psycopg is required when JUTOPIA_DEV_NO_DB is false")
   return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
@@ -258,6 +271,104 @@ def member_to_client(member: dict) -> dict:
   }
 
 
+DEV_STATE = {
+  "bootstrapped": False,
+  "users": [],
+  "email_verifications": [],
+  "clubs": [],
+  "club_members": [],
+}
+
+
+def now_text() -> str:
+  return datetime.now(timezone.utc).isoformat()
+
+
+def dev_id() -> str:
+  return secrets.token_hex(16)
+
+
+def ensure_dev_state() -> None:
+  if DEV_STATE["bootstrapped"]:
+    return
+
+  created_at = now_text()
+  user = {
+    "id": dev_id(),
+    "email": "demo@jutopia.ac.kr",
+    "password_hash": hash_password("demo1234"),
+    "student_id": "20241234",
+    "department": "Computer Science",
+    "nickname": "Demo User",
+    "profile_image_url": "",
+    "status_message": "DB-less dev account",
+    "created_at": created_at,
+  }
+  club = {
+    "id": dev_id(),
+    "name": "Artisanal Jam",
+    "description": "Demo club for DB-less local evaluation",
+    "profile_image_url": "",
+    "invite_code": "JAM2024",
+    "created_by": user["id"],
+    "dday": "2024-09-12",
+    "color": "#6b3518",
+    "tags": ["Demo", "Music", "Club"],
+    "role_tags": ["President", "Staff", "Member"],
+    "created_at": created_at,
+  }
+  membership = {
+    "id": dev_id(),
+    "club_id": club["id"],
+    "user_id": user["id"],
+    "generation": "12",
+    "role": "PRESIDENT",
+    "status": "ACTIVE",
+    "joined_at": created_at,
+  }
+  DEV_STATE["users"] = [user]
+  DEV_STATE["clubs"] = [club]
+  DEV_STATE["club_members"] = [membership]
+  DEV_STATE["email_verifications"] = []
+  DEV_STATE["bootstrapped"] = True
+
+
+def dev_user_by_email(email: str) -> dict | None:
+  ensure_dev_state()
+  normalized = email.lower()
+  return next((user for user in DEV_STATE["users"] if user["email"].lower() == normalized), None)
+
+
+def dev_user_by_id(user_id: str) -> dict | None:
+  ensure_dev_state()
+  return next((user for user in DEV_STATE["users"] if str(user["id"]) == str(user_id)), None)
+
+
+def dev_memberships(user_id: str) -> tuple[list[dict], list[dict]]:
+  ensure_dev_state()
+  memberships = []
+  clubs = []
+  for member in DEV_STATE["club_members"]:
+    if str(member["user_id"]) != str(user_id):
+      continue
+    club = next((item for item in DEV_STATE["clubs"] if item["id"] == member["club_id"]), None)
+    if not club:
+      continue
+    memberships.append(member_to_client(member))
+    clubs.append(club_to_client(club))
+  return memberships, clubs
+
+
+def dev_invite_code() -> str:
+  ensure_dev_state()
+  existing = {club["invite_code"] for club in DEV_STATE["clubs"]}
+  for _ in range(20):
+    code = f"JT{secrets.randbelow(900000) + 100000}"
+    if code not in existing:
+      return code
+  raise RuntimeError("Could not generate an invite code")
+
+
 def fetch_user_by_email(conn, email: str) -> dict | None:
   return conn.execute(
     """
@@ -363,9 +474,12 @@ class JutopiaHandler(SimpleHTTPRequestHandler):
   def handle_api(self, method: str, path: str):
     try:
       if method == "GET" and path == "/api/health":
+        if DEV_NO_DB:
+          ensure_dev_state()
+          return self.send_json(200, {"ok": True, "mode": "memory"})
         with db() as conn:
           conn.execute("SELECT 1").fetchone()
-        return self.send_json(200, {"ok": True})
+        return self.send_json(200, {"ok": True, "mode": "postgres"})
 
       if method == "POST" and path == "/api/auth/send-code":
         return self.send_code()
@@ -389,7 +503,7 @@ class JutopiaHandler(SimpleHTTPRequestHandler):
       return self.send_json(401, {"error": str(error)})
     except ValueError as error:
       return self.send_json(400, {"error": str(error)})
-    except psycopg.errors.UniqueViolation:
+    except UNIQUE_VIOLATION_ERROR:
       return self.send_json(409, {"error": "이미 가입된 이메일입니다."})
     except Exception as error:
       print(f"[server] {type(error).__name__}: {error}", file=sys.stderr)
@@ -398,6 +512,26 @@ class JutopiaHandler(SimpleHTTPRequestHandler):
   def send_code(self):
     data = self.read_json()
     email = email_from_auth_payload(data)
+
+    if DEV_NO_DB:
+      ensure_dev_state()
+      if dev_user_by_email(email):
+        raise ValueError("Email is already registered.")
+      code = f"{secrets.randbelow(1_000_000):06d}"
+      DEV_STATE["email_verifications"].insert(0, {
+        "id": dev_id(),
+        "email": email,
+        "code": code,
+        "expires_at": time.time() + 5 * 60,
+        "verified_at": None,
+        "created_at": now_text(),
+      })
+      send_verification_email(email, code)
+      payload = {"ok": True, "email": email, "mode": "memory"}
+      if EMAIL_MODE == "dev":
+        payload["devCode"] = code
+        payload["message"] = "Dev verification code generated."
+      return self.send_json(200, payload)
 
     with db() as conn:
       if fetch_user_by_email(conn, email):
@@ -422,6 +556,19 @@ class JutopiaHandler(SimpleHTTPRequestHandler):
     data = self.read_json()
     email = email_from_auth_payload(data)
     code = str(data.get("code", "")).strip()
+    if DEV_NO_DB:
+      ensure_dev_state()
+      row = next((
+        item for item in DEV_STATE["email_verifications"]
+        if item["email"].lower() == email.lower()
+        and item["code"] == code
+        and item["expires_at"] > time.time()
+      ), None)
+      if not row:
+        raise ValueError("Verification code is invalid or expired.")
+      row["verified_at"] = now_text()
+      return self.send_json(200, {"ok": True, "mode": "memory", "message": "Email verified."})
+
     with db() as conn:
       row = conn.execute(
         """
@@ -447,6 +594,36 @@ class JutopiaHandler(SimpleHTTPRequestHandler):
     password = str(data.get("password", ""))
     if len(password) < 8:
       raise ValueError("비밀번호는 8자 이상이어야 합니다.")
+
+    if DEV_NO_DB:
+      ensure_dev_state()
+      verified = any(
+        item["email"].lower() == email.lower() and item["verified_at"]
+        for item in DEV_STATE["email_verifications"]
+      )
+      if not verified:
+        raise ValueError("Email verification is required.")
+      if dev_user_by_email(email):
+        raise ValueError("Email is already registered.")
+      user = {
+        "id": dev_id(),
+        "email": email,
+        "password_hash": hash_password(password),
+        "student_id": student_id,
+        "department": str(data.get("department", "")).strip(),
+        "nickname": str(data.get("nickname", "")).strip() or email.split("@")[0],
+        "profile_image_url": str(data.get("profileImageUrl", "")).strip(),
+        "status_message": str(data.get("statusMessage", "")).strip(),
+        "created_at": now_text(),
+      }
+      DEV_STATE["users"].append(user)
+      return self.send_json(201, {
+        "token": make_token(user),
+        "user": user_to_client(user),
+        "memberships": [],
+        "clubs": [],
+        "mode": "memory",
+      })
 
     with db() as conn:
       verified = conn.execute(
@@ -482,6 +659,19 @@ class JutopiaHandler(SimpleHTTPRequestHandler):
     data = self.read_json()
     email = str(data.get("email", "")).strip().lower()
     password = str(data.get("password", ""))
+    if DEV_NO_DB:
+      user = dev_user_by_email(email)
+      if not user or not verify_password(password, user["password_hash"]):
+        raise PermissionError("Email or password is invalid.")
+      memberships, clubs = dev_memberships(str(user["id"]))
+      return self.send_json(200, {
+        "token": make_token(user),
+        "user": user_to_client(user),
+        "memberships": memberships,
+        "clubs": clubs,
+        "mode": "memory",
+      })
+
     with db() as conn:
       user = fetch_user_by_email(conn, email)
       if not user or not verify_password(password, user["password_hash"]):
@@ -498,6 +688,18 @@ class JutopiaHandler(SimpleHTTPRequestHandler):
 
   def me(self):
     user_id = self.current_user_id()
+    if DEV_NO_DB:
+      user = dev_user_by_id(user_id)
+      if not user:
+        raise PermissionError("User not found")
+      memberships, clubs = dev_memberships(user_id)
+      return self.send_json(200, {
+        "user": user_to_client(user),
+        "memberships": memberships,
+        "clubs": clubs,
+        "mode": "memory",
+      })
+
     with db() as conn:
       user = fetch_user_by_id(conn, user_id)
       if not user:
@@ -511,6 +713,10 @@ class JutopiaHandler(SimpleHTTPRequestHandler):
 
   def my_clubs(self):
     user_id = self.current_user_id()
+    if DEV_NO_DB:
+      memberships, clubs = dev_memberships(user_id)
+      return self.send_json(200, {"memberships": memberships, "clubs": clubs, "mode": "memory"})
+
     with db() as conn:
       memberships, clubs = fetch_memberships(conn, user_id)
     return self.send_json(200, {"memberships": memberships, "clubs": clubs})
@@ -530,6 +736,44 @@ class JutopiaHandler(SimpleHTTPRequestHandler):
     description = str(data.get("description", "")).strip()
     if not description:
       description = f"{', '.join(tags)} 동아리" if tags else "새롭게 생성된 동아리"
+
+    if DEV_NO_DB:
+      ensure_dev_state()
+      if not dev_user_by_id(user_id):
+        raise PermissionError("User not found")
+      club = {
+        "id": dev_id(),
+        "name": name,
+        "description": description,
+        "profile_image_url": profile_image_url,
+        "invite_code": dev_invite_code(),
+        "created_by": user_id,
+        "dday": dday,
+        "color": color,
+        "tags": tags,
+        "role_tags": role_tags,
+        "created_at": now_text(),
+      }
+      membership = {
+        "id": dev_id(),
+        "club_id": club["id"],
+        "user_id": user_id,
+        "generation": "1",
+        "role": "PRESIDENT",
+        "status": "ACTIVE",
+        "joined_at": now_text(),
+      }
+      DEV_STATE["clubs"].append(club)
+      DEV_STATE["club_members"].append(membership)
+      client_club = club_to_client(club)
+      client_membership = member_to_client(membership)
+      return self.send_json(201, {
+        "club": client_club,
+        "membership": client_membership,
+        "clubs": [client_club],
+        "memberships": [client_membership],
+        "mode": "memory",
+      })
 
     with db() as conn:
       invite_code = generate_invite_code(conn)
@@ -579,6 +823,23 @@ class JutopiaHandler(SimpleHTTPRequestHandler):
     club_id = str(data.get("clubId", "")).strip()
     if not club_id:
       raise ValueError("동아리 ID가 필요합니다.")
+
+    if DEV_NO_DB:
+      ensure_dev_state()
+      row = next((
+        member for member in DEV_STATE["club_members"]
+        if str(member["club_id"]) == club_id and str(member["user_id"]) == user_id
+      ), None)
+      club = next((item for item in DEV_STATE["clubs"] if str(item["id"]) == club_id), None)
+      if not row or not club:
+        raise ValueError("User is not a member of this club.")
+      if row["role"] == "PRESIDENT" or str(club["created_by"]) == user_id:
+        raise ValueError("Club owners cannot leave their own club in dev mode.")
+      DEV_STATE["club_members"] = [
+        member for member in DEV_STATE["club_members"]
+        if str(member["id"]) != str(row["id"])
+      ]
+      return self.send_json(200, {"ok": True, "mode": "memory", "message": "Left club."})
 
     with db() as conn:
       row = conn.execute(
